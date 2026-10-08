@@ -1,0 +1,286 @@
+from pathlib import Path
+from collections import deque
+
+import random
+import math
+from copy import deepcopy
+
+import pyarrow.parquet as pq
+import pyarrow.dataset as ds
+import pyarrow.csv as pv
+# TODO: max_batches and preprocess func and drop_last and skip_invalid
+# TODO: skip n first items when reading (optional)
+
+def advanced_batching(iterable, batch_size, overlap, skip_n_first_items=0):
+    step = batch_size - overlap
+    if step <= 0:
+        raise ValueError("ERROR: (Batch size - overlap) must be greater than 0")
+
+    it = iter(iterable)
+    for _ in range(skip_n_first_items):
+        next(it)
+
+    window = deque(maxlen=batch_size)
+
+    for _ in range(batch_size):
+        try:
+            window.append(next(it))
+        except StopIteration:
+            return
+    yield tuple(window)
+
+    while True:
+        try:
+            for _ in range(step):
+                window.append(next(it))
+        except StopIteration:
+            return
+        yield tuple(window)
+
+
+class ReaderConfig:
+    def __init__(
+            self,
+            path,
+            batch_size=1,
+            overlap=0,
+            shuffle=False,
+            max_batches=-1,
+            ignore_first_n_items=0,
+            preprocess_func=None,
+            columns=None,
+            auto_generate_header=False,
+            logs=False,
+            items_count=None,
+        ):
+
+        self.path = path
+
+        self.batch_size = batch_size
+        self.overlap = overlap
+        self.shuffle = shuffle
+        self.max_batches = max_batches
+        self.preprocess_func = preprocess_func
+        self.ignore_first_n_items = ignore_first_n_items
+
+        # columns can be either a list of indices, names or None if you want to include every column
+        self.columns = columns
+        self.auto_generate_header = auto_generate_header
+        self.total_items_count = items_count
+
+        self.logs = logs
+
+    def duplicate_for_children(self):
+        path_obj = Path(self.path).resolve()
+
+        if not path_obj.exists():
+            raise FileNotFoundError(f"ERROR: Nothing found at path {self.path}")
+
+        if not path_obj.is_dir():
+            raise TypeError(f"ERROR: {self.path} must be a directory")
+
+        paths_to_check = [path_obj]
+        out = []
+
+        while len(paths_to_check) > 0:
+            for i in reversed(range(len(paths_to_check))):
+                if paths_to_check[i].is_dir():
+                    for child in paths_to_check[i].iterdir():
+                        paths_to_check.append(child)
+                else:
+                    child_config = deepcopy(self)
+                    child_config.path = paths_to_check[i]
+                    out.append(child_config)
+
+                paths_to_check.pop(i)
+
+        return out
+
+
+class FileReader:
+    _readers: dict[str, type["FileReader"]] = {}
+
+    def _raw_read(self): # streams items one by one in subclasses
+        raise NotImplementedError
+
+    def _calculate_item_count(self):
+        raise NotImplementedError
+
+    def read(self):
+        self.read_items_count = 0
+
+        items = advanced_batching(
+            self._raw_read(), self.config.batch_size, self.config.overlap, self.config.ignore_first_n_items
+        ) if self.config.batch_size > 1 else self._raw_read()
+
+        if self.config.shuffle:
+            items = list(items)
+            random.shuffle(items)
+
+        for item in items:
+            yield item
+            self.read_items_count += 1
+
+    @classmethod
+    def register(cls, extension: str, reader_cls: type["FileReader"]):
+        cls._readers[extension] = reader_cls
+
+    def __new__(cls, config: ReaderConfig, *args, **kwargs):
+        if cls is DirectoryReader:
+            return super().__new__(cls)
+
+        path_obj = Path(config.path).resolve()
+
+        if not path_obj.exists():
+            raise FileNotFoundError(f"ERROR: Nothing found at path {config.path}")
+
+        if path_obj.is_dir():
+            raise TypeError("ERROR: FileReader cannot be a directory! Use DirectoryReader instead.")
+
+        extension = path_obj.suffix
+        if extension not in cls._readers:
+            raise ValueError(f"ERROR: Unsupported extension: {extension}")
+
+        if config.logs:
+            print("Registered file \"" + str(config.path) + "\"")
+
+        return super().__new__(cls._readers[extension])
+
+    def __init__(self, config: ReaderConfig):
+        self.config = config
+
+        step = self.config.batch_size - self.config.overlap
+        if step <= 0:
+            raise ValueError(f"ERROR: Batch size must be greater than overlap")
+
+        total_rows = max(self._calculate_item_count() - self.config.ignore_first_n_items, 0)
+
+        if total_rows < self.config.batch_size:
+            items_count = 0
+        else:
+            items_count = math.ceil((total_rows - self.config.batch_size) / step) + 1
+
+        self.config.total_items_count = max(0, items_count)
+
+        self.read_items_count = 0
+
+
+class DirectoryReader(FileReader):
+
+    def __init__(self, parent_config: ReaderConfig, children_sources: list[ReaderConfig]):
+        self.subreaders = [FileReader(config) for config in children_sources]
+
+        super().__init__(parent_config)
+
+    def _raw_read(self):
+        active_readers = [
+            {"gen": iter(reader.read()), "reader": reader}
+            for reader in self.subreaders
+            if reader.config.total_items_count > 0
+        ]
+
+        while active_readers:
+            total_active_count = self.config.total_items_count - self.read_items_count
+
+            if total_active_count <= 0:
+                break
+
+            choice = random.random()
+
+            for item in active_readers:
+                prob = (item["reader"].config.total_items_count - item["reader"].read_items_count) / total_active_count
+
+                if prob <= 0.0:
+                    active_readers.remove(item)
+                    break
+
+                if choice > prob:
+                    choice -= prob
+                    continue
+
+                # try getting the next element if there is one
+                try:
+                    out = next(item["gen"])
+                    yield out
+                except StopIteration:
+                    active_readers.remove(item)
+                    break
+
+
+    def _calculate_item_count(self):
+        return sum(r.config.total_items_count for r in self.subreaders)
+
+
+class ColumnarReader(FileReader):
+    def __init__(self, config, column_names):
+        super().__init__(config)
+        self._columns_to_include = []
+
+        if self.config.columns is None:
+            self._columns_to_include = column_names
+        else:
+            for col in self.config.columns:
+                if isinstance(col, str):
+                    if col not in column_names:
+                        raise ValueError(f"Column {col} specified by config does not exist in the file!")
+                    self._columns_to_include.append(col)
+
+                elif isinstance(col, (int, float)):
+                    idx = int(col)
+                    if idx < 0 or idx >= len(column_names):
+                        raise IndexError(f"Column index {idx} is out of bounds for the file columns!")
+                    self._columns_to_include.append(column_names[idx])
+                else:
+                    raise ValueError(f"Invalid column name: {col}. Column name must be str or int.")
+
+    def _read_record(self):
+        raise NotImplementedError
+
+    def _raw_read(self):
+        for batch in self._read_record():
+
+            columns = [col.to_pylist() for col in batch.columns]
+
+            for row in zip(*columns):
+                yield row
+
+
+class ParquetReader(ColumnarReader):
+    def __init__(self, config):
+        self._parquet_file = pq.ParquetFile(config.path)
+
+        super().__init__(config, self._parquet_file.schema_arrow.names)
+
+    def _read_record(self):
+        _BATCH_SIZE = 128
+
+        for batch in self._parquet_file.iter_batches(columns=self._columns_to_include, batch_size=_BATCH_SIZE):
+            yield batch
+
+    def _calculate_item_count(self):
+        return self._parquet_file.metadata.num_rows
+
+
+class CSVReader(ColumnarReader):
+    def __init__(self, config):
+        self.read_options = pv.ReadOptions(
+            autogenerate_column_names=config.auto_generate_header,
+        )
+
+        with pv.open_csv(config.path, read_options=self.read_options) as reader:
+            super().__init__(config, reader.schema.names)
+
+    def _read_record(self):
+        convert_options = pv.ConvertOptions(include_columns=self._columns_to_include)
+
+        with pv.open_csv(self.config.path, convert_options=convert_options, read_options=self.read_options) as reader:
+            for batch in reader:
+                yield batch
+
+    def _calculate_item_count(self):
+        return ds.dataset(self.config.path, format=ds.CsvFileFormat(read_options=self.read_options)).count_rows()
+
+
+FileReader.directory_reader = DirectoryReader
+FileReader.register(".parquet", ParquetReader)
+FileReader.register(".csv", CSVReader)
