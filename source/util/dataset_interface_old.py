@@ -106,7 +106,7 @@ class FileReader:
     def _calculate_item_count(self):
         raise NotImplementedError
 
-    def read(self):
+    def _read(self):
         self.read_items_count = 0
 
         items = advanced_batching(
