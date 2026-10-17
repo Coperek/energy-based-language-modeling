@@ -1,21 +1,33 @@
-# TODO: dataset interface changed, so this must change as well
-
 from pathlib import Path
+from tqdm import tqdm
 
 from tokenizers import Tokenizer, decoders, pre_tokenizers
 from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
 
-TOKENIZER_PATH = str(Path(__file__).parent.parent.joinpath("tokenizer.json"))
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+
+TOKENIZER_DEFAULT_PATH = str(Path(__file__).parent.parent.joinpath("tokenizer.json"))
 
 
 class BPETokenizer:
-    def __init__(self, unk_token="<unk>", vocab_size=32000,
-                 train_samples=1_000_000, train_batch_size=128,):
+    def __init__(
+            self,
+            training_data_batch_iterator,
+            samples_count=None,
+            vocab_size=32000,
+            load_if_exists=True,
+            eos_token="<eos>",
+            unk_token="<unk>",
+            path=TOKENIZER_DEFAULT_PATH,
+    ):
+
         self.special_tokens = {}
 
-        if Path(TOKENIZER_PATH).exists():
-            self.tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
+        if Path(path).exists() and load_if_exists:
+            self.tokenizer = Tokenizer.from_file(path)
         else:
             self.tokenizer = Tokenizer(
                 BPE(fuse_unk=True, unk_token=unk_token)
@@ -24,16 +36,7 @@ class BPETokenizer:
             self.tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
             self.tokenizer.decoder = decoders.ByteLevel()
 
-            print("Tokenizer creation in progress...")
-            data_path = input("[Tokenizer training] Enter the path to the data directory or file:")
-
-            if not Path(data_path).exists():
-                raise Exception(f"Path {data_path} does not exist!")
-
-            data_generator = dataset_interface.FileReader.create(data_path).read_batches(
-                batch_size=train_batch_size,
-                max_batches=train_samples//train_batch_size
-            )
+            print("Tokenizer training in progress...")
 
             trainer = BpeTrainer(
                 vocab_size=vocab_size,
@@ -41,13 +44,16 @@ class BPETokenizer:
             )
 
             print("Please wait... (this can take a while)")
-            self.tokenizer.train_from_iterator(data_generator, trainer)
-            self.tokenizer.save(TOKENIZER_PATH)
+
+            self.tokenizer.train_from_iterator(training_data_batch_iterator, trainer, length=samples_count)
+            self.tokenizer.save(path)
 
             print(f"Tokenizer training finished. Vocab size: {self.tokenizer.get_vocab_size()}")
 
-        if unk_token:
-            self.register_special_token(unk_token)
+        self.eos_token = eos_token
+        if not self.eos_token:
+            raise ValueError("EOS token must be provided")
+        self.register_special_token(eos_token)
 
     def encode(self, text):
         if hasattr(text, "__iter__") and not isinstance(text, str):
@@ -66,12 +72,90 @@ class BPETokenizer:
             for _id in ids
         ]
 
+    def encode_stream(self, iterator):
+        """
+        Encodes data provided by iterator and yields tokens ids one by one,
+        automatically injects EoS tokens.
+        """
+        for text in iterator:
+            if hasattr(text, "__iter__") and not isinstance(text, str):
+                # batch of texts
+                for ids in self.encode(text):
+                    for _ in ids:
+                        yield _
+                    yield self.special_tokens[self.eos_token]
+            else:
+                for _ in self.encode(text):
+                    yield _
+                yield self.special_tokens[self.eos_token]
+
     def get_vocab_size(self) -> int:
         return self.tokenizer.get_vocab_size(with_added_tokens=True) + len(self.special_tokens)
-        # special tokens are completely outside the vocabulary
 
     def register_special_token(self, token_name: str) -> int:
+        # special tokens are completely outside the regular vocabulary
         self.special_tokens.update({token_name: self.get_vocab_size()})
         return self.special_tokens[token_name]
 
-# TODO: special tokens: <|im_start|>system <|im_start|>user <|im_start|>assistant
+    def create_tokenized_dataset(
+            self,
+            data_iterator,
+            output_dir: str,
+            total_data_samples: int,
+            batch_size=4096,
+            max_tokens_per_file: int = 67108864,
+            max_files: int = 64,
+            datatype: pa.DataType = pa.int32(),
+    ):
+
+        out_dir_obj = Path(output_dir)
+
+        if not out_dir_obj.exists():
+            raise ValueError("Output directory does not exist")
+        if not out_dir_obj.is_dir():
+            raise ValueError("Output path must be a directory")
+
+        column_name = "tokens"
+        schema = pa.schema([
+            (column_name, datatype)
+        ])
+
+        finished = False
+        with (tqdm(total=total_data_samples, unit="doc") as pbar):
+
+            file_i = 0
+            while file_i < max_files:
+
+                path = output_dir
+                path += f"tokenized_dataset_{file_i}.parquet" \
+                    if path.endswith("/") \
+                    else f"/tokenized_dataset_{file_i}.parquet"
+
+                tokens_written = 0
+                with pq.ParquetWriter(path, schema=schema) as writer:
+                    while tokens_written < max_tokens_per_file:
+
+                        texts = []
+                        for i in range(batch_size):
+                            try:
+                                texts.append(next(data_iterator))
+                            except StopIteration:
+                                finished = True
+                                break
+
+                        batch_tokens = self.encode(texts)
+                        unified_tokens = []
+                        for tokens in batch_tokens:
+                            unified_tokens.extend(tokens)
+                            unified_tokens.append(self.special_tokens[self.eos_token])
+
+                        table = pa.table({column_name: unified_tokens}, schema=schema)
+                        writer.write(table)
+
+                        tokens_written += len(unified_tokens)
+                        pbar.update(len(batch_tokens))
+
+                        if finished:
+                            return
+
+                file_i += 1

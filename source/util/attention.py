@@ -5,7 +5,7 @@ from flash_attn.layers.rotary import RotaryEmbedding
 
 
 class FlashSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, rope_theta, window_size: int = -1,):
+    def __init__(self, dim: int, num_heads: int, rope_theta=10_000, causal=True, window_size: int = -1,):
         super().__init__()
 
         assert dim % num_heads == 0
@@ -13,8 +13,10 @@ class FlashSelfAttention(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.causal = causal
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.query = nn.Linear(dim, dim, bias=False)
+        self.key_value = nn.Linear(dim, dim * 2, bias=False)
         self.out = nn.Linear(dim, dim, bias=False)
 
         self.rotary = RotaryEmbedding(
@@ -29,23 +31,42 @@ class FlashSelfAttention(nn.Module):
         else:
             self.window = (window_size, window_size)
 
-    def forward(self, x):
-
+    def calculate_query(self, x):
         B, S, _ = x.shape
 
-        qkv = self.qkv(x)
-        qkv = qkv.view(B, S, 3, self.num_heads, self.head_dim)
+        query = self.query(x)
+        query = query.view(B, S, self.num_heads, self.head_dim)
+        query = self.rotary(query)
 
-        qkv_roped = self.rotary(qkv)
+        return query
 
-        q_roped, k_roped, v = qkv_roped.unbind(dim=2)
+    def calculate_key_value(self, x):
+        B, S, _ = x.shape
+
+        kv = self.key_value(x)
+        kv = kv.view(B, S, 2, self.num_heads, self.head_dim)
+        k, v = kv.unbind(dim=2)
+
+        k = self.rotary(k)
+
+        return k, v
+
+    def forward_qkv(self, q, k, v):
 
         out = flash_attn_func(
-            q_roped, k_roped, v,
-            causal=True,
+            q, k, v,
+            causal=self.causal,
             window_size=self.window,
         )
 
-        out = out.reshape(B, S, self.dim)
+        out = out.reshape(q.shape[0], q.shape[1], self.dim)
 
         return self.out(out)
+
+
+    def forward(self, x):
+
+        q = self.calculate_query(x)
+        k, v = self.calculate_key_value(x)
+
+        return self.forward_qkv(q, k, v)

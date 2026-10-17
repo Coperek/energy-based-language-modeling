@@ -173,13 +173,13 @@ class DirectoryReader(FileReader):
         super().__init__(parent_config)
 
     def _raw_read(self):
-        active_readers = [
+        active_gens = [
             {"gen": iter(reader.read()), "reader": reader}
             for reader in self.subreaders
             if reader.config.total_items_count > 0
         ]
 
-        while active_readers:
+        while active_gens:
             total_active_count = self.config.total_items_count - self.read_items_count
 
             if total_active_count <= 0:
@@ -187,11 +187,11 @@ class DirectoryReader(FileReader):
 
             choice = random.random()
 
-            for item in active_readers:
+            for item in active_gens:
                 prob = (item["reader"].config.total_items_count - item["reader"].read_items_count) / total_active_count
 
                 if prob <= 0.0:
-                    active_readers.remove(item)
+                    active_gens.remove(item)
                     break
 
                 if choice > prob:
@@ -203,7 +203,7 @@ class DirectoryReader(FileReader):
                     out = next(item["gen"])
                     yield out
                 except StopIteration:
-                    active_readers.remove(item)
+                    active_gens.remove(item)
                     break
 
 
