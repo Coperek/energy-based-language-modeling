@@ -10,6 +10,8 @@ import random
 import pyarrow.parquet as pq
 import pyarrow as pa
 
+import torch
+
 
 def pyarrow_concat(
         inputs: Iterable[Union[pa.Table, pa.Array, pa.ChunkedArray]],
@@ -61,7 +63,7 @@ def build_batches(iterator, batch_size: int, drop_last: bool = False) -> Generat
 def windows_to_table(windows) -> pa.Table:
     """List of window tables -> table with one row per window (list-typed columns)."""
     big = pyarrow_concat(windows, zero_copy_arrays=False)
-    offsets = pa.array([0, *accumulate(w.num_rows for w in windows)], type=pa.int32())
+    offsets = pa.array([0, *accumulate(len(w) for w in windows)], type=pa.int32())
 
     arrays = [
         pa.ListArray.from_arrays(offsets, big.column(name).combine_chunks())
@@ -112,7 +114,7 @@ class ReaderConfig:
         skip_first_n_items: int = 0,
         drop_last: bool = False,
         shuffle_mode: Literal["none", "disk", "ram"] = "none",
-        output_mode: Literal["pyarrow", "python", "pandas"] = "pyarrow",
+        output_mode: Literal["pyarrow", "python", "pandas", "pytorch"] = "pyarrow",
         disk_read_size: int = 4096,
         logs: bool = False,
     ):
@@ -128,7 +130,7 @@ class ReaderConfig:
         assert self.window_overlap < self.window_size
         assert self.skip_first_n_items >= 0
         assert self.shuffle_mode in ["none", "disk", "ram"]
-        assert self.output_mode in ["pyarrow", "python", "pandas"]
+        assert self.output_mode in ["pyarrow", "python", "pandas", "pytorch"]
         
     @property
     def window_size(self):
@@ -157,14 +159,23 @@ class ReaderConfig:
     def convert_output(self, iterator):
         match self.output_mode:
             case "python":
-                for _ in iterator:
-                    yield _.to_pylist()[0] if self.window_size == 1 else _.to_pylist()
+                for item in iterator:
+                    yield item.to_pylist()[0] if self.window_size == 1 else item.to_pylist()
             case "pandas":
-                for _ in iterator:
-                    yield _.to_pandas().iloc(0) if self.window_size == 1 else _.to_pandas()
+                for item in iterator:
+                    yield item.to_pandas().iloc(0) if self.window_size == 1 else item.to_pandas()
+            case "pytorch":
+                for item in iterator:
+                    if isinstance(item, pa.Array):
+                        yield torch.from_dlpack(item)
+                    else:
+                        yield {
+                            col_name: torch.from_dlpack(item[col_name])
+                            for col_name in item.schema.names
+                        }
             case _:
-                for _ in iterator:
-                    yield _ # TODO
+                for item in iterator:
+                    yield item
 
 
 class Reader:

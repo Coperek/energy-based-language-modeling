@@ -6,7 +6,9 @@ from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
 
 import pyarrow as pa
-import pyarrow.parquet as pq
+
+from util import dataset_interface as data
+from itertools import batched
 
 
 TOKENIZER_DEFAULT_PATH = str(Path(__file__).parent.parent.joinpath("tokenizer.json"))
@@ -40,7 +42,8 @@ class BPETokenizer:
 
             trainer = BpeTrainer(
                 vocab_size=vocab_size,
-                special_tokens=[unk_token]
+                special_tokens=[unk_token],
+                initial_alphabet=pre_tokenizers.ByteLevel.alphabet,
             )
 
             print("Please wait... (this can take a while)")
@@ -75,7 +78,7 @@ class BPETokenizer:
     def encode_stream(self, iterator):
         """
         Encodes data provided by iterator and yields tokens ids one by one,
-        automatically injects EoS tokens.
+        automatically injecting EoS tokens.
         """
         for text in iterator:
             if hasattr(text, "__iter__") and not isinstance(text, str):
@@ -102,10 +105,9 @@ class BPETokenizer:
             data_iterator,
             output_dir: str,
             total_data_samples: int,
-            batch_size=4096,
-            max_tokens_per_file: int = 67108864,
-            max_files: int = 64,
-            datatype: pa.DataType = pa.int32(),
+            sequence_length: int,
+            disk_write_batch_size=65_536,
+            datatype: pa.DataType = pa.int32()
     ):
 
         out_dir_obj = Path(output_dir)
@@ -115,47 +117,37 @@ class BPETokenizer:
         if not out_dir_obj.is_dir():
             raise ValueError("Output path must be a directory")
 
-        column_name = "tokens"
-        schema = pa.schema([
-            (column_name, datatype)
-        ])
+        path = output_dir
+        path += f"tokenized_dataset.parquet" \
+            if path.endswith("/") \
+            else f"/tokenized_dataset.parquet"
 
-        finished = False
+        column_name = "tokens"
+        schema = pa.schema([(column_name, datatype)])
+
         with (tqdm(total=total_data_samples, unit="doc") as pbar):
 
-            file_i = 0
-            while file_i < max_files:
+            def encode_stream(iterator):
+                for text in iterator:
+                    pbar.update(len(text))
+                    if hasattr(text, "__iter__") and not isinstance(text, str):
+                        # batch of texts
+                        for ids in self.encode(text):
+                            for _ in ids:
+                                yield _
+                            yield self.special_tokens[self.eos_token]
+                    else:
+                        for _ in self.encode(text):
+                            yield _
+                        yield self.special_tokens[self.eos_token]
 
-                path = output_dir
-                path += f"tokenized_dataset_{file_i}.parquet" \
-                    if path.endswith("/") \
-                    else f"/tokenized_dataset_{file_i}.parquet"
+            def process_windows(windows_pylists_iter):
+                """converts lists of integers into single item tables"""  # TODO: count token occurrences
+                for windows_pylist in windows_pylists_iter:
+                    yield pa.table({column_name:windows_pylist}, schema=schema)
 
-                tokens_written = 0
-                with pq.ParquetWriter(path, schema=schema) as writer:
-                    while tokens_written < max_tokens_per_file:
+            stream_iter = encode_stream(data_iterator)
+            stream_iter = batched(stream_iter, sequence_length) # sequence batching
+            stream_iter = process_windows(stream_iter)
 
-                        texts = []
-                        for i in range(batch_size):
-                            try:
-                                texts.append(next(data_iterator))
-                            except StopIteration:
-                                finished = True
-                                break
-
-                        batch_tokens = self.encode(texts)
-                        unified_tokens = []
-                        for tokens in batch_tokens:
-                            unified_tokens.extend(tokens)
-                            unified_tokens.append(self.special_tokens[self.eos_token])
-
-                        table = pa.table({column_name: unified_tokens}, schema=schema)
-                        writer.write(table)
-
-                        tokens_written += len(unified_tokens)
-                        pbar.update(len(batch_tokens))
-
-                        if finished:
-                            return
-
-                file_i += 1
+            data.disk_shuffle(stream_iter, disk_write_batch_size, path)
