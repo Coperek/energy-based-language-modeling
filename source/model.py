@@ -283,7 +283,7 @@ class EnergyTransformer(nn.Module):
     def fit(
             self,
             train_path: str,
-            eval_path: str,
+            eval_path: str | None,
             batch_size: int,
             model_save_path: str,
             load_if_exists=True,
@@ -458,14 +458,14 @@ class EnergyTransformer(nn.Module):
 
                     self.save_checkpoint(model_save_path, optimizer, scheduler, current_progress, loss_history)
 
-        eval_reader = data.ParquetReader(
-            eval_path,
-            config=data.ReaderConfig(output_mode="python"),
-            columns=0,
-        )
-
         self.save_checkpoint(model_save_path, optimizer, scheduler, current_progress, loss_history)
 
-        if eval_reader is not None:
+        if eval_path is not None:
+            eval_reader = data.ParquetReader(
+                eval_path,
+                config=data.ReaderConfig(output_mode="python"),
+                columns=0,
+            )
+
             eval_loss = self.evaluate_model(eval_reader.read_batched(batch_size=batch_size, drop_last=True))
             print("Evaluation loss for this epoch: ", eval_loss)

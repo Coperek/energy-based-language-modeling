@@ -43,7 +43,7 @@ class BPETokenizer:
             trainer = BpeTrainer(
                 vocab_size=vocab_size,
                 special_tokens=[unk_token],
-                initial_alphabet=pre_tokenizers.ByteLevel.alphabet,
+                initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
             )
 
             print("Please wait... (this can take a while)")
