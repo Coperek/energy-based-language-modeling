@@ -18,7 +18,7 @@ from tqdm import tqdm
 import os
 
 
-def generate_unigram(indices_windows_iterator, indices_count, max_windows=65536):
+def generate_unigram(indices_windows_iterator, indices_count, max_windows=1_000_000):
     counts = torch.zeros((indices_count,), dtype=torch.long)
 
     with tqdm(total=max_windows) as pbar:
@@ -32,6 +32,18 @@ def generate_unigram(indices_windows_iterator, indices_count, max_windows=65536)
     return unigram
 
 
+class RMSNorm(nn.Module): # better dtype handling
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))  # same name and shape as nn.RMSNorm
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        xf = x.float()
+        out = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return (out * self.weight).to(x.dtype)
+
+
 class EnergyTransformerBlock(nn.Module):
 
     def __init__(self, dim, heads, rope_theta, context_window=-1, dropout=0.0, max_seq_len=2048):
@@ -39,11 +51,11 @@ class EnergyTransformerBlock(nn.Module):
 
         self.activation = nn.GELU(approximate="tanh")
 
-        self.norm1 = nn.RMSNorm(dim)
+        self.norm1 = RMSNorm(dim)
         self.attention = FlashSelfAttention(dim, heads, rope_theta, window_size=context_window, max_seq_len=max_seq_len)
         self.dropout1 = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
 
-        self.norm2 = nn.RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
         self.linear_up = nn.Linear(dim, dim * 4)
         self.linear_down = nn.Linear(dim * 4, dim)
         self.dropout2 = nn.Dropout(p=dropout / 2.0) if dropout > 0 else nn.Identity()
@@ -75,16 +87,33 @@ class EnergyTransformerBlock(nn.Module):
 
         return positives_out, negatives_out
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_cached(self, x, cache_k, cache_v):
+        if self.training:
+            raise Exception("forward_training() must be used during training instead of forward()")
 
+        pos = cache_k.shape[1] - 1
+        attention_in = self.norm1(x)
+
+        my_k, my_v = self.attention.calculate_key_value(attention_in, offset=pos)
+        my_q = self.attention.calculate_query(attention_in, offset=pos)
+
+        attention_out = self.attention.forward_qkv(my_q, cache_k, cache_v)
+
+        mlp_in = attention_out + x
+        mlp_out = self.linear_down(self.activation(self.linear_up(self.norm2(mlp_in)))) + mlp_in
+        return mlp_out, my_k, my_v
+
+    def forward_and_return_cache(self, x: torch.Tensor):
         if self.training:
             raise Exception("forward_training() must be used during training instead of forward()")
 
         attention_in = self.norm1(x)
 
         k_cache, v_cache = self.attention.calculate_key_value(attention_in)
-        k_shifted = torch.cat([torch.zeros_like(k_cache[:, :1, :, :]), k_cache[:, :-1, :, :]], dim=1)
-        v_shifted = torch.cat([torch.zeros_like(v_cache[:, :1, :, :]), v_cache[:, :-1, :, :]], dim=1)
+        k_cache = torch.cat([torch.zeros_like(k_cache[:, :1, :, :]), k_cache], dim=1)
+        v_cache = torch.cat([torch.zeros_like(v_cache[:, :1, :, :]), v_cache], dim=1)
+        k_shifted = k_cache[:, :-1, :, :]
+        v_shifted = v_cache[:, :-1, :, :]
         query = self.attention.calculate_query(attention_in)
 
         attention_out = self.attention.forward_qkv(query, k_shifted, v_shifted)
@@ -94,7 +123,11 @@ class EnergyTransformerBlock(nn.Module):
         mlp_hidden = self.linear_down(self.activation(mlp_hidden))
         mlp_hidden = mlp_hidden + attention_out
 
-        return mlp_hidden
+        return mlp_hidden, k_cache, v_cache
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, cache_k, cache_v = self.forward_and_return_cache(x)
+        return out
 
 
 class EnergyTransformer(nn.Module):
@@ -112,13 +145,10 @@ class EnergyTransformer(nn.Module):
             max_sequence_length: int,
             rope_theta: int = 10_000,
             dropout: float = 0.0,
-            augmentation_methods_mix=(0.4, 0.2, 0.4)
     ):
         super().__init__()
-        assert abs(sum(augmentation_methods_mix) - 1.0) < 1e-6
 
         self.unigram = None
-        self.mix = augmentation_methods_mix
         self.device = device
         self.sequence_length = max_sequence_length
 
@@ -137,7 +167,7 @@ class EnergyTransformer(nn.Module):
             nn.init.normal_(b.attention.out.weight, std=0.02 / math.sqrt(2 * num_blocks))
             nn.init.normal_(b.linear_down.weight, std=0.02 / math.sqrt(2 * num_blocks))
 
-        self.final_norm = nn.RMSNorm(dim)
+        self.final_norm = RMSNorm(dim)
 
         self.to(device)
 
@@ -145,7 +175,6 @@ class EnergyTransformer(nn.Module):
 
         self.representation = (
             "EnergyTransformer: "
-            f"Aug methods mix: {self.mix}, "
             f"Sequence length: {self.sequence_length}, "
             f"Vocab size: {self.vocab_size}, "
             f"Dim: {dim}, "
@@ -176,7 +205,7 @@ class EnergyTransformer(nn.Module):
         )
         return real_loss + fake_loss
 
-    def make_negatives(self, x):
+    def make_negatives(self, x, aug_mix):
         B, S = x.shape
         dev = x.device
         pos = torch.arange(S, device=dev).expand(B, S)
@@ -186,7 +215,7 @@ class EnergyTransformer(nn.Module):
         nearby = x.gather(1, (pos + off).clamp(0, S - 1))
         uni = torch.multinomial(self.unigram, x.numel(), replacement=True).view(B, S)
 
-        src = torch.multinomial(torch.tensor(self.mix, device=dev), x.numel(), replacement=True).view(B, S)
+        src = torch.multinomial(torch.tensor(aug_mix, device=dev), x.numel(), replacement=True).view(B, S)
         neg = torch.where(src == 0, same_seq, torch.where(src == 1, nearby, uni))
 
         neg_target = (neg != x).float().detach()
@@ -198,11 +227,11 @@ class EnergyTransformer(nn.Module):
             out1, out2 = checkpoint(block.forward_training, out1, out2, use_reentrant=False)
         return out1, out2
 
-    def forward_training(self, x: torch.Tensor):
+    def forward_training(self, x: torch.Tensor, aug_mix):
         assert self.unigram is not None
 
         positives = x
-        negatives, source, negatives_target = self.make_negatives(x)
+        negatives, source, negatives_target = self.make_negatives(x, aug_mix)
 
         out1 = self.embedding(positives).to(torch.bfloat16)
         out2 = self.embedding(negatives).to(torch.bfloat16)
@@ -214,28 +243,57 @@ class EnergyTransformer(nn.Module):
 
         return out1, out2, source, negatives_target
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_cached(self, token_id, k_cache, v_cache):
+        emb = self.embedding(torch.tensor([[token_id]], device=self.device))
+        return self.forward_cached_embedding(emb, k_cache, v_cache)
 
+    def forward_cached_embedding(self, emb: torch.Tensor, cache_k: list[torch.Tensor], cache_v: list[torch.Tensor]):
         if self.training:
             raise Exception("forward_training() must be used during training instead of forward()")
 
+        my_k_cache, my_v_cache = [], []
         with torch.amp.autocast(device_type=torch.device(self.device).type, dtype=torch.bfloat16):
+            out = emb.to(torch.bfloat16)
 
-            out = self.embedding(x).to(torch.bfloat16)
+            for i, block in enumerate(self.blocks):
+                out, new_k_cache, new_v_kache = block.forward_cached(out, cache_k[i], cache_v[i])
+                my_k_cache.append(new_k_cache)
+                my_v_cache.append(new_v_kache)
+
+            out = F.sigmoid(self.out(self.final_norm(out)).float())
+            out = out.squeeze(0).squeeze(0)
+            return out, my_k_cache, my_v_cache
+
+    def forward(self, x: torch.Tensor, output_cache=False):
+        if self.training:
+            raise Exception("forward_training() must be used during training instead of forward()")
+
+        my_k_cache, my_v_cache = [], []
+        with torch.amp.autocast(device_type=torch.device(self.device).type, dtype=torch.bfloat16):
+            out = self.embedding(x.to(self.device)).to(torch.bfloat16)
 
             for block in self.blocks:
-                out = block.forward(out)
+                if output_cache:
+                    out, k_cache, v_cache = block.forward_and_return_cache(out)
+                    my_k_cache.append(k_cache)
+                    my_v_cache.append(v_cache)
+                else:
+                    out = block.forward(out)
 
-            out = F.sigmoid(
-                self.out(self.final_norm(out)).float()
-            )
-            return out
+            out = F.sigmoid(self.out(self.final_norm(out)).float())
+
+        if output_cache:
+            return out, my_k_cache, my_v_cache
+
+        return out
 
     def save_model(self, path):
         torch.save(self.state_dict(), path)
 
-    def load_model(self, path):
-        self.load_state_dict(torch.load(path, weights_only=False))
+    def load(self, path):
+        c = torch.load(path, weights_only=False)
+        self.load_state_dict(c["model"])
+        self.unigram = c["unigram"]
 
     def save_checkpoint(
             self,
@@ -255,6 +313,7 @@ class EnergyTransformer(nn.Module):
                     'scheduler': scheduler.state_dict(),
                     'progress': progress,
                     'loss_history': loss_history,
+                    'unigram': self.unigram,
                 }, f)
                 f.flush()
                 os.fsync(f.fileno())
@@ -265,7 +324,7 @@ class EnergyTransformer(nn.Module):
                 os.remove(tmp_path)
             raise
 
-    def evaluate_model(self, batch_iterator):
+    def evaluate_model(self, batch_iterator, aug_mix):
         self.eval()
 
         total_loss = 0
@@ -273,7 +332,7 @@ class EnergyTransformer(nn.Module):
             for i, batch in enumerate(batch_iterator):
                 with torch.amp.autocast(device_type=torch.device(self.device).type, dtype=torch.bfloat16):
                     out1, out2, source, neg_target = self.forward_training(
-                        torch.tensor(batch, device=self.device)
+                        torch.tensor(batch, device=self.device), aug_mix
                     )
                     total_loss += self.loss_func(out1, out2, neg_target)
 
@@ -290,6 +349,7 @@ class EnergyTransformer(nn.Module):
             max_tokens: int | None = None,
             compile_blocks: bool = True,
             # hyperparams
+            augmentation_methods_mix=(.4, .2, .4),
             max_lr: float=6e-4,
             warmup_steps: float=800,
             start_lr_div_factor=20.0,
@@ -302,18 +362,10 @@ class EnergyTransformer(nn.Module):
             loss_history_delay: int = 5,
             checkpoint_delay: int = 100,
     ):
+        assert abs(sum(augmentation_methods_mix) - 1.0) < 1e-6
+
         if logs:
             print(self.__repr__())
-            print("Generating unigram...")
-
-        self.unigram = generate_unigram(
-            data.ParquetReader(
-                train_path,
-                config=data.ReaderConfig(output_mode="python",),
-                columns=0,
-            ).read(),
-            self.vocab_size
-        ).to(self.device)
 
         assert batch_size > 0
 
@@ -336,6 +388,8 @@ class EnergyTransformer(nn.Module):
             self.load_state_dict(checkpoint_loaded['model'])
             current_progress = checkpoint_loaded['progress']
             loss_history = checkpoint_loaded['loss_history']
+            if 'unigram' in checkpoint_loaded:
+                self.unigram = checkpoint_loaded['unigram']
 
             if logs:
                 plt.plot(loss_history["overall"], label="overall", color="black")
@@ -344,6 +398,17 @@ class EnergyTransformer(nn.Module):
                 plt.plot(loss_history["unigram"], label="unigram", linestyle="dashed", color="blue")
                 plt.plot(loss_history["real"], label="real", linestyle="dashed", color="orange")
                 plt.show()
+
+        if self.unigram is None:
+            print("Generating unigram...")
+            self.unigram = generate_unigram(
+                data.ParquetReader(
+                    train_path,
+                    config=data.ReaderConfig(output_mode="python", ),
+                    columns=0,
+                ).read(),
+                self.vocab_size
+            ).to(self.device)
 
         if compile_blocks and not getattr(self, "_compiled", False):
             self._blocks_forward_training = torch.compile(self._blocks_forward_training)
@@ -402,7 +467,7 @@ class EnergyTransformer(nn.Module):
 
                 with torch.amp.autocast(device_type=self.device, dtype=torch.bfloat16):
                     out1, out2, src, neg_target = self.forward_training(
-                        torch.tensor(batch, device=self.device)
+                        torch.tensor(batch, device=self.device), augmentation_methods_mix
                     )
                     loss_real, loss_fake = self.loss_func_raw(out1, out2, neg_target, reduction="none")
 
@@ -467,5 +532,8 @@ class EnergyTransformer(nn.Module):
                 columns=0,
             )
 
-            eval_loss = self.evaluate_model(eval_reader.read_batched(batch_size=batch_size, drop_last=True))
+            eval_loss = self.evaluate_model(
+                eval_reader.read_batched(batch_size=batch_size, drop_last=True),
+                augmentation_methods_mix
+            )
             print("Evaluation loss for this epoch: ", eval_loss)

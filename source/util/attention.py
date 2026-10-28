@@ -45,14 +45,12 @@ class FlashSelfAttention(nn.Module):
         else:
             self.window = (window_size, window_size)
 
-    def _rope(self, x):
-        # Interleaved RoPE (rotates pairs x[2i], x[2i+1]) -- same convention as
-        # flash_attn's RotaryEmbedding(interleaved=True). Pure PyTorch, so inductor can fuse it.
+    def _rope(self, x, offset: int = 0):
         B, S, H, D = x.shape
-        assert S <= self.max_seq_len, f"sequence length {S} exceeds max_seq_len {self.max_seq_len}"
+        assert offset + S <= self.max_seq_len, f"position {offset + S} exceeds max_seq_len {self.max_seq_len}"
 
-        cos = self.rope_cos[:S][None, :, None, :]
-        sin = self.rope_sin[:S][None, :, None, :]
+        cos = self.rope_cos[offset:offset + S][None, :, None, :]
+        sin = self.rope_sin[offset:offset + S][None, :, None, :]
 
         xf = x.float().reshape(B, S, H, D // 2, 2)
         x1, x2 = xf.unbind(dim=-1)
@@ -60,25 +58,16 @@ class FlashSelfAttention(nn.Module):
         out = torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1).flatten(-2)
         return out.to(x.dtype)  # math in fp32, back to bf16/fp16 for flash-attn
 
-    def calculate_query(self, x):
+    def calculate_query(self, x, offset: int = 0):
         B, S, _ = x.shape
+        query = self.query(x).view(B, S, self.num_heads, self.head_dim)
+        return self._rope(query, offset)
 
-        query = self.query(x)
-        query = query.view(B, S, self.num_heads, self.head_dim)
-        query = self._rope(query)
-
-        return query
-
-    def calculate_key_value(self, x):
+    def calculate_key_value(self, x, offset: int = 0):
         B, S, _ = x.shape
-
-        kv = self.key_value(x)
-        kv = kv.view(B, S, 2, self.num_heads, self.head_dim)
+        kv = self.key_value(x).view(B, S, 2, self.num_heads, self.head_dim)
         k, v = kv.unbind(dim=2)
-
-        k = self._rope(k)
-
-        return k, v
+        return self._rope(k, offset), v
 
     def forward_qkv(self, q, k, v):
 
