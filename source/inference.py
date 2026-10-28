@@ -5,18 +5,13 @@ from tqdm import tqdm
 
 
 def _energy(out: torch.Tensor) -> torch.Tensor:
-    # The model outputs P(fake). The logit keeps useful gradients where the sigmoid saturates.
     return torch.logit(out.float().reshape(()), eps=1e-6)
 
 
 class _KVBuffer:
-    """Preallocated per-layer K/V cache.
-
-    The old code did torch.cat on every layer for every generated token, which reallocated and
-    copied the whole cache each step. Here the memory is allocated once and the model gets
-    views of the filled part, so model.forward_cached works unchanged.
     """
-
+    Preallocated per-layer K/V cache.
+    """
     def __init__(self, ks, vs, extra_slots: int):
         layers, n = len(ks), ks[0].shape[1]
         shape = (layers, 1, n + extra_slots, *ks[0].shape[2:])
@@ -59,7 +54,6 @@ class Session:
     def _prefill(self, text: str, max_new_tokens: int, logs: bool):
         tokenized = self.tokenizer.encode(text)
 
-        # RoPE tables only cover model.sequence_length positions
         room = self.model.sequence_length - len(tokenized)
         if room <= 0:
             raise ValueError(
@@ -74,17 +68,17 @@ class Session:
                     print(f"{self.tokenizer.decode([tok])}: {score}")
             kv = _KVBuffer(ks, vs, max_new_tokens)
 
-        del output, ks, vs  # the temporary per-layer cache is no longer needed
+        del output, ks, vs
         return tokenized, kv, max_new_tokens
 
-    def generate_langevin(# TODO: langeving sucks right now, to be fixed
+    def generate_langevin(
             self,
-            max_steps=240,        # most gradient steps spent on one token, shared by all of its chains
-            chain_steps=30,       # most steps of a single chain
-            min_chain_steps=8,    # a chain never stops before this many steps
-            patience=6,           # a chain stops after this many steps without a `tol` improvement
-            stale_chains=3,       # a token stops after this many chains in a row without a `tol` improvement
-            tol=0.02,             # improvement threshold, in logit units
+            max_steps=240,
+            chain_steps=30,
+            min_chain_steps=8,
+            patience=6,
+            stale_chains=3,
+            tol=0.02,
             step_size=0.15,
             noise=0.05,
             verify_top_k=4,
@@ -113,6 +107,7 @@ class Session:
                 e = _energy(out)
                 (g,) = torch.autograd.grad(e, x)
                 used += 1
+                print(e)
 
                 e_val = e.item()
                 if e_val < best_e:
@@ -141,7 +136,6 @@ class Session:
                     x, n_steps = run_chain(ks, vs, max_steps - used)
                 used += n_steps
 
-                # snap to real tokens (O(V) memory, no (V, D) temporaries), then let the exact energy decide
                 near = (table_sq - 2.0 * (table @ x[0])).topk(verify_top_k, largest=False).indices.tolist()
 
                 improved = False
@@ -178,7 +172,7 @@ class Session:
             print("Result:", "".join(self.tokenizer.decode(tokenized)))
         return self.tokenizer.decode(generated)
 
-    @torch.no_grad()  # without this the whole prompt and every candidate built an autograd graph
+    @torch.no_grad()
     def generate_exact(self, p=0.01, max_new_tokens=64, logs=False):
         text = self.history[-1]['text']  # TODO: not instruction tunning yet
         tokenized, kv, max_new_tokens = self._prefill(text, max_new_tokens, logs)
@@ -187,7 +181,6 @@ class Session:
         unigram = self.model.unigram
         assert unigram is not None, "model.unigram must be set before generate_exact"
 
-        # sort once, not once per token; penalties are computed in one vectorised pass
         order = torch.argsort(unigram, descending=True)
         penalty = (-torch.log(unigram[order] + 1e-12) * p).tolist()
         order = order.tolist()
@@ -198,14 +191,13 @@ class Session:
 
             with tqdm(total=len(order), disable=not logs) as pbar:
                 for tok, pen in zip(order, penalty):
-                    # penalties only grow along the list and the score is never below its penalty
                     if pen >= best:
                         break
 
                     out, new_k, new_v = self.model.forward_cached(tok, ks, vs)
                     score = out.item() + pen
                     if score < best:
-                        best, best_tok, best_kv = score, tok, (new_k, new_v)  # keeps only the best candidate's K/V
+                        best, best_tok, best_kv = score, tok, (new_k, new_v)
 
                     pbar.update(1)
 
