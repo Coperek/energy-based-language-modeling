@@ -55,10 +55,9 @@ def train():
 def inference():
     m.load(model_save_path)
     session = Session(m, t)
-    session.message(input("Enter prompt:"), role="system")
-    session.generate_exact(p=0.002, logs=True)
+    session.message("Once upon a time, there was a beautiful princess. She", role="system")
+    session.generate_exact(p=0.004, logs=True)
 
 
 if __name__ == '__main__':
-    train()
     inference()

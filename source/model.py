@@ -96,8 +96,13 @@ class EnergyTransformerBlock(nn.Module):
 
         my_k, my_v = self.attention.calculate_key_value(attention_in, offset=pos)
         my_q = self.attention.calculate_query(attention_in, offset=pos)
+        B = my_q.shape[0]
 
-        attention_out = self.attention.forward_qkv(my_q, cache_k, cache_v)
+        attention_out = self.attention.forward_qkv(
+            my_q,
+            cache_k.expand(B, -1, -1, -1),
+            cache_v.expand(B, -1, -1, -1),
+        )
 
         mlp_in = attention_out + x
         mlp_out = self.linear_down(self.activation(self.linear_up(self.norm2(mlp_in)))) + mlp_in
@@ -244,7 +249,7 @@ class EnergyTransformer(nn.Module):
         return out1, out2, source, negatives_target
 
     def forward_cached(self, token_id, k_cache, v_cache):
-        emb = self.embedding(torch.tensor([[token_id]], device=self.device))
+        emb = self.embedding(token_id.to(device=self.device)).unsqueeze(1)
         return self.forward_cached_embedding(emb, k_cache, v_cache)
 
     def forward_cached_embedding(self, emb: torch.Tensor, cache_k: list[torch.Tensor], cache_v: list[torch.Tensor]):
@@ -261,7 +266,6 @@ class EnergyTransformer(nn.Module):
                 my_v_cache.append(new_v_kache)
 
             out = F.sigmoid(self.out(self.final_norm(out)).float())
-            out = out.squeeze(0).squeeze(0)
             return out, my_k_cache, my_v_cache
 
     def forward(self, x: torch.Tensor, output_cache=False):

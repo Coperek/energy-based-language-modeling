@@ -1,11 +1,9 @@
-import math
+import random
 
 import torch
 from tqdm import tqdm
 
-
-def _energy(out: torch.Tensor) -> torch.Tensor:
-    return torch.logit(out.float().reshape(()), eps=1e-6)
+from itertools import batched
 
 
 class _KVBuffer:
@@ -73,107 +71,77 @@ class Session:
 
     def generate_langevin(
             self,
-            max_steps=240,
-            chain_steps=30,
-            min_chain_steps=8,
-            patience=6,
-            stale_chains=3,
-            tol=0.02,
-            step_size=0.15,
-            noise=0.05,
-            verify_top_k=4,
-            max_new_tokens=64,
+            max_steps=32,
+            trial_count=64,
+            max_output_tokens=100,
+            noise=0.1,
             logs=False,
     ):
-        assert max_steps >= 1 and chain_steps >= 1
+        assert max_steps >= 1 and trial_count >= 1
 
-        text = self.history[-1]['text']  # TODO: not instruction tunning yet
-        tokenized, kv, max_new_tokens = self._prefill(text, max_new_tokens, logs)
+        text = self.history[-1]['text']  # TODO: no instruction tunning yet
+        tokenized, kv, max_new_tokens = self._prefill(text, max_output_tokens, logs)
         generated = []
-        steps_log = []
 
-        table = self.model.embedding.weight.detach().float()   # (V, D), shares storage with the model
-        table_sq = table.pow(2).sum(-1)                         # (V,), used for nearest-token search
-        rms = (table_sq.sum() / table.numel()).sqrt()
-
-        def run_chain(ks, vs, budget):
-            """Langevin descent from a random token embedding. Returns (lowest-energy point, steps used)."""
-            x = table[torch.randint(len(table), (1,), device=table.device)].clone()   # (1, D)
-            best_x, best_e, stale, used = x, float("inf"), 0, 0
-
-            for s in range(min(chain_steps, budget)):
-                x = x.detach().requires_grad_(True)
-                out, _, _ = self.model.forward_cached_embedding(x.unsqueeze(0), ks, vs)
-                e = _energy(out)
-                (g,) = torch.autograd.grad(e, x)
-                used += 1
-                print(e)
-
-                e_val = e.item()
-                if e_val < best_e:
-                    best_x = x.detach().clone()
-                if e_val < best_e - tol:
-                    stale = 0
-                else:
-                    stale += 1
-                    if used >= min_chain_steps and stale >= patience:
-                        break  # plateau: this chain has stopped improving
-                best_e = min(best_e, e_val)
-
-                g = g / (g.pow(2).mean().sqrt() + 1e-8)
-                temp = noise * (1 - s / chain_steps)
-                x = x.detach() - step_size * rms * g + temp * rms * torch.randn_like(x)
-
-            return best_x, used
+        table = self.model.embedding.weight.detach().float()
 
         for _ in range(max_new_tokens):
+
             ks, vs = kv.views()
-            best_e, best_tok, best_kv = float("inf"), None, None
-            seen, used, stale_count = set(), 0, 0
+            best_token, best_e, best_kv = 0, float("inf"), None
 
-            while used < max_steps and stale_count < stale_chains:
-                with torch.enable_grad():
-                    x, n_steps = run_chain(ks, vs, max_steps - used)
-                used += n_steps
+            visited = torch.full((len(table),), False, device=table.device, dtype=torch.bool)
 
-                near = (table_sq - 2.0 * (table @ x[0])).topk(verify_top_k, largest=False).indices.tolist()
+            for trial in range(trial_count):
 
-                improved = False
-                with torch.no_grad():
-                    for tok in near:
-                        if tok in seen:
-                            continue
-                        seen.add(tok)
-                        out, new_k, new_v = self.model.forward_cached(tok, ks, vs)
-                        e = _energy(out).item()
-                        if e < best_e - tol:
-                            improved = True
-                        if e < best_e:
-                            best_e, best_tok, best_kv = e, tok, (new_k, new_v)
+                token = random.randint(0, len(table) - 1)
 
-                stale_count = 0 if improved else stale_count + 1
+                for i in range(max_steps):
 
-            steps_log.append(used)
+                    emb = table[token].clone()
+                    emb = emb.detach().unsqueeze(0).requires_grad_(True)
+                    out, new_k, new_v = self.model.forward_cached_embedding(emb.unsqueeze(0), ks, vs)
+                    visited[token] = True
+
+                    energy = out.float().reshape(())
+                    (grad,) = torch.autograd.grad(energy, emb)
+                    grad += torch.randn_like(grad) * noise * torch.var(grad)
+
+                    if energy < best_e:
+                        best_e, best_token, best_kv = energy, token, (new_k, new_v)
+                        print(f"{self.tokenizer.decode([best_token])}: {best_e}")
+
+                    table_relative = table - emb
+                    table_ranked = torch.cosine_similarity(table_relative, grad, dim=-1)
+                    table_ranked = torch.where(visited, -1.0, table_ranked)
+
+                    max_index = torch.argmax(table_ranked, dim=-1)
+
+                    if len(max_index.shape) > 0:
+                        token = [i.item() for i in max_index][0]
+                    else:
+                        token = max_index.item()
+
             if logs:
-                p_fake = 1.0 / (1.0 + math.exp(-best_e))
-                print(f"{self.tokenizer.decode([best_tok])}: {p_fake} ({used} steps)")
+                print(f"Best continuation: {self.tokenizer.decode([best_token])}")
 
-            if best_tok == self.eos_id:
+            if best_token == self.eos_id:
                 break
 
             kv.append(*best_kv)
-            generated.append(best_tok)
-            tokenized.append(best_tok)
+            generated.append(best_token)
+            tokenized.append(best_token)
 
-        if logs:
-            if steps_log:
-                print(f"Gradient steps per token: avg {sum(steps_log) / len(steps_log):.1f}, "
-                      f"min {min(steps_log)}, max {max(steps_log)}")
-            print("Result:", "".join(self.tokenizer.decode(tokenized)))
         return self.tokenizer.decode(generated)
 
     @torch.no_grad()
-    def generate_exact(self, p=0.01, max_new_tokens=64, logs=False):
+    def generate_exact(
+            self,
+            p=0.01,
+            batch_size=1024,
+            max_new_tokens=64,
+            logs=False
+    ):
         text = self.history[-1]['text']  # TODO: not instruction tunning yet
         tokenized, kv, max_new_tokens = self._prefill(text, max_new_tokens, logs)
         generated = []
@@ -190,16 +158,27 @@ class Session:
             best, best_tok, best_kv = float("inf"), None, None
 
             with tqdm(total=len(order), disable=not logs) as pbar:
-                for tok, pen in zip(order, penalty):
-                    if pen >= best:
+                for token_batch, penalty_batch in zip(batched(order, batch_size), batched(penalty, batch_size)):
+                    if penalty_batch[0] >= best:
                         break
 
-                    out, new_k, new_v = self.model.forward_cached(tok, ks, vs)
-                    score = out.item() + pen
-                    if score < best:
-                        best, best_tok, best_kv = score, tok, (new_k, new_v)
+                    out, new_k, new_v = self.model.forward_cached(torch.tensor(token_batch, device=self.model.device), ks, vs)
 
-                    pbar.update(1)
+                    penalty_batch = torch.tensor(penalty_batch, device=out.device).unsqueeze(-1).unsqueeze(-1)
+                    out += penalty_batch
+
+                    batch_best_i = torch.argmin(out)
+                    if len(batch_best_i.shape) > 0:
+                        batch_best_i = batch_best_i[0].item()
+                    else:
+                        batch_best_i = batch_best_i.item()
+                    batch_best = out[batch_best_i].item()
+
+                    if batch_best < best:
+                        batch_best_kv = ([k[batch_best_i] for k in new_k], [v[batch_best_i] for v in new_v])
+                        best, best_tok, best_kv = batch_best, token_batch[batch_best_i], batch_best_kv
+
+                    pbar.update(batch_size)
 
             if logs:
                 print(f"Best continuation: {self.tokenizer.decode([best_tok])}")
@@ -213,4 +192,5 @@ class Session:
 
         if logs:
             print(f"Result: {self.tokenizer.decode(tokenized)}")
+
         return self.tokenizer.decode(generated)

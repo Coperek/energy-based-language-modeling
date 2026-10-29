@@ -70,7 +70,6 @@ class FlashSelfAttention(nn.Module):
         return self._rope(k, offset), v
 
     def forward_qkv(self, q, k, v):
-
         out = flash_attn_func(
             q, k, v,
             causal=self.causal,
